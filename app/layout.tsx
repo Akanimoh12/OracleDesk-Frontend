@@ -4,6 +4,8 @@ import Navbar from "@/components/layout/Navbar";
 import { Footer } from "@/components/layout/Footer";
 import { WalletProvider } from "@/lib/contexts/WalletContext";
 import "./globals.css";
+import { RealtimeProvider } from "@/lib/realtime/RealtimeProvider";
+import { InboxProvider } from "@/lib/notifications/InboxProvider";
 
 const geistSans = {
   variable: "--font-geist-sans",
@@ -40,9 +42,13 @@ export default function RootLayout({
       </head>
       <body className="min-h-full flex flex-col font-body-md text-on-surface">
         <WalletProvider>
-          <Navbar />
-          {children}
-          <Footer />
+          <RealtimeProvider>
+            <InboxProvider>
+              <Navbar />
+              {children}
+              <Footer />
+            </InboxProvider>
+          </RealtimeProvider>
         </WalletProvider>
       </body>
     </html>
