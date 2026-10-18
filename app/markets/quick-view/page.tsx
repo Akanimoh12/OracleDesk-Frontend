@@ -13,11 +13,13 @@ import { useQuery } from "@tanstack/react-query";
 import { useMarket } from "@/lib/hooks/useMarkets";
 import { getMarketByOnChainId } from "@/lib/api/markets";
 import { ApiError } from "@/lib/api/client";
-import { useBuy, useOnChainMarket, usePosition, useQuoteBuy, useUsdcBalance, useAccountReserve, usePrepareBuy, useMarketConfig, useLedgerNow, useEnableUsdc, useUsdcTrustline, useExactBuyQuote, usePositionState, useUsdcBalanceState } from "@/lib/hooks/useStellar";
+import { useBuy, useOnChainMarket, usePosition, useQuoteBuy, useUsdcBalance, useAccountReserve, usePrepareBuy, useMarketConfig, useLedgerNow, useEnableUsdc, useUsdcTrustline, useExactBuyQuote, usePositionState, useUsdcBalanceState, useAccountAuth, usePrepareMultisig } from "@/lib/hooks/useStellar";
 import { useWallet } from "@/lib/contexts/WalletContext";
 import { explorerTx } from "@/lib/stellar/config";
 import { formatUsdc, formatXlm, maxIn, minOut, tryParseUsdc } from "@/lib/stellar/units";
 import { buyBreakdown } from "@/lib/stellar/buy-breakdown";
+import { isMultisigAccount, MULTISIG_DEFAULT_SLIPPAGE_BPS, type MultisigSession } from "@/lib/stellar/multisig";
+import { MultisigReview } from "@/components/multisig-review";
 
 import type { TxPhase } from "@/lib/stellar/tx-lifecycle";
 import { preflightBuy } from "@/lib/stellar/preflight";
@@ -114,6 +116,12 @@ function MarketQuickViewContent() {
   const trustlineUnauthorized = trustline.data?.kind === "present" && !trustline.data.authorized;
   const buy = useBuy();
   const submitQueue = useSubmitQueueState(address);
+  const accountAuth = useAccountAuth(address);
+  const isMultisig = accountAuth.data ? isMultisigAccount(accountAuth.data) : false;
+  const [multisigMode, setMultisigMode] = useState(false);
+  const [multisigSession, setMultisigSession] = useState<MultisigSession | null>(null);
+  const [multisigStatus, setMultisigStatus] = useState<string | null>(null);
+  const prepareMultisig = usePrepareMultisig();
   const [now, setNow] = useState<number | null>(null);
 
   useEffect(() => {
@@ -252,6 +260,41 @@ function MarketQuickViewContent() {
       setBuyStatus("USDC is enabled. Review your amount and click Buy to submit the trade.");
     } catch (err) {
       setBuyStatus(err instanceof Error ? err.message : "Couldn't enable USDC.");
+    }
+  };
+
+  const handlePrepareMultisig = async () => {
+    if (!isConnected) {
+      void openModal();
+      return;
+    }
+    if (!onChainMarketId) return;
+    if (isWrongNetwork) {
+      setMultisigStatus("Switch your wallet to Stellar Testnet to prepare this trade.");
+      return;
+    }
+    if (!spendRaw || spendRaw <= 0n) {
+      setMultisigStatus(buyMode === "usdc" ? "Enter an amount like 10 or 2.5." : "Enter a share amount greater than zero.");
+      return;
+    }
+    if (buyMode === "shares") {
+      setMultisigStatus("Multisig prepare currently supports USDC amounts. Switch to USDC and try again.");
+      return;
+    }
+    setMultisigStatus(null);
+    try {
+      const session = await prepareMultisig.mutateAsync({
+        kind: "buy",
+        marketId: onChainMarketId,
+        outcome: side,
+        collateralIn: spendRaw,
+        slippageBps: MULTISIG_DEFAULT_SLIPPAGE_BPS,
+        sourceAccount: address ?? undefined,
+        timeoutInSeconds: 3600,
+      });
+      setMultisigSession(session);
+    } catch (err) {
+      setMultisigStatus(err instanceof Error ? err.message : "Couldn't prepare the multisig transaction.");
     }
   };
 
@@ -544,6 +587,42 @@ function MarketQuickViewContent() {
                     {!buy.isPending && buyStatus && (
                       <p className="text-xs text-on-surface-variant break-all" role="status">{buyStatus}</p>
                     )}
+
+                    {/* Multisig path */}
+                    {isConnected && (
+                      <div className="rounded-lg border border-outline-variant bg-surface-container-low p-3 space-y-2">
+                        <label className="flex items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={multisigMode}
+                            onChange={(e) => setMultisigMode(e.target.checked)}
+                          />
+                          Use multisig (export XDR for co-signers)
+                        </label>
+                        {accountAuth.isLoading && <p className="text-[11px] text-on-surface-variant">Checking multisig thresholds…</p>}
+                        {isMultisig && !multisigMode && (
+                          <p className="text-[11px] text-on-surface-variant">
+                            This account needs multiple signatures (medium threshold {accountAuth.data?.med}, {accountAuth.data?.signers.length} signers). For treasuries, use “Prepare for multisig”.
+                          </p>
+                        )}
+                        {(multisigMode || isMultisig) && (
+                          <div className="space-y-2">
+                            <button
+                              type="button"
+                              onClick={handlePrepareMultisig}
+                              disabled={prepareMultisig.isPending || !spendRaw || spendRaw <= 0n}
+                              className="bg-surface-container px-3 py-2 rounded-lg text-xs font-bold border border-outline-variant disabled:opacity-50"
+                            >
+                              {prepareMultisig.isPending ? "Preparing…" : "Prepare for multisig"}
+                            </button>
+                            <p className="text-[11px] text-on-surface-variant">
+                              Builds with a 1-hour window and 3% slippage. Quote is from the current ledger; the trade fails with SlippageExceeded (error 12) if the price moves further.
+                            </p>
+                            {multisigStatus && <p className="text-xs text-on-surface-variant" role="status">{multisigStatus}</p>}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -592,6 +671,13 @@ function MarketQuickViewContent() {
           changedFrom={reviewModel.changedFrom}
           onConfirm={() => closeReview(true)}
           onCancel={() => closeReview(false)}
+        />
+      )}
+      {multisigSession && (
+        <MultisigReview
+          session={multisigSession}
+          onClose={() => setMultisigSession(null)}
+          onUpdated={(next) => setMultisigSession(next)}
         />
       )}
     </main>

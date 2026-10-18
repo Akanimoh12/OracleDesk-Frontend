@@ -169,3 +169,35 @@ To try the same on market 0 (resolved): the buy button is disabled and the panel
 
 These wallet-signing steps require a browser wallet and funded test account;
 the automated suite does not submit financial transactions.
+
+## 12. Multisig (2-of-3) export/import XDR
+
+Needs a 2-of-3 testnet account with a USDC trustline and test USDC (step 4).
+Use Stellar Lab (https://lab.stellar.org) plus Freighter, or two Freighter
+profiles for the co-signers.
+
+a. **Create the multisig account (Stellar Lab):**
+
+- [ ] Create account C as the treasury `G…` (fund with Friendbot).
+- [ ] Create signer accounts A and B (`G…`), fund each with Friendbot.
+- [ ] In Lab → Transaction Builder, build `setOptions` from C with master weight 1, low 1, medium 2, high 2, adding A (weight 1) and B (weight 1). Sign with C and submit.
+- [ ] Add the USDC trustline from C (changeTrust), then ask a maintainer to mint test USDC to C (step 4b).
+
+b. **Prepare a buy (coordinator may be A, B or an outsider):**
+
+- [ ] Connect with any wallet, open `/markets/quick-view?onChainId=<open market>`. The panel shows “This account needs multiple signatures” and offers “Prepare for multisig”.
+- [ ] Check “Use multisig”, enter 10 USDC, click **Prepare for multisig**. A review shows the operation (`buy`), contract, `min_shares_out` (3% slippage from the ledger-N quote), fee, sequence, 1-hour expiry countdown and `0/2` progress.
+- [ ] Click **Copy XDR**. The session persists in `sessionStorage` (`oracledesk_multisig_sessions`), so a reload during coordination doesn’t lose collected signatures.
+
+c. **Collect two signatures out of band:**
+
+- [ ] In Lab → Transaction → Sign (or Freighter “Sign transaction XDR”): paste the XDR, sign with A, copy the signed XDR. Paste it into **Import signed XDR** → Import. Progress shows `1/2`.
+- [ ] Repeat with B. Progress shows `2/2` and **Submit** enables. An XDR signed by an unrelated key shows an “unknown signature” warning (it would fail with `tx_bad_auth_extra`).
+- [ ] Tamper with fee/time bounds in Lab and import: the app rejects it (“does not match the prepared one”).
+
+d. **Submit at threshold:**
+
+- [ ] Click **Submit**. The app re-reads the account sequence (another transaction from C in the meantime fails with “Another transaction from this account changed the sequence”), checks `weight >= med`, submits via RPC and polls `getTransaction`.
+- [ ] Let a prepared session expire (or prepare with a 20 s window in dev): submit fails with “This transaction expired before it was submitted. Prepare it again with a fresh quote.” (`tx_too_late`).
+- [ ] Repeat for the daily-pass USDC `transfer` on `/premium`: check “Use multisig”, **Prepare multisig payment**, collect 2 signatures, submit. The backend `unlock` still verifies the transfer afterwards.
+- [ ] If the market’s `close_time` passes first, the trade fails with MarketClosed (error 9); the review shows close time next to expiry and caps the window at close time.

@@ -24,21 +24,29 @@ export function rpcServer(): rpc.Server {
   return _rpcServer;
 }
 
-function options(contractId: string, signer?: Signer): ClientOptions {
+function options(
+  contractId: string,
+  signer?: Signer,
+  extra?: { timeoutInSeconds?: number },
+): ClientOptions & { timeoutInSeconds?: number } {
   return {
     contractId,
     networkPassphrase: NETWORK_PASSPHRASE,
     rpcUrl: RPC_URL,
     allowHttp: RPC_URL.startsWith("http://"),
     ...(signer ? { publicKey: signer.publicKey, signTransaction: signer.signTransaction } : {}),
+    ...(extra?.timeoutInSeconds !== undefined ? { timeoutInSeconds: extra.timeoutInSeconds } : {}),
   };
 }
 
-export const marketCore = (signer?: Signer) => new MarketCoreClient(options(CONTRACTS.marketCore, signer));
-export const treasury = (signer?: Signer) => new TreasuryClient(options(CONTRACTS.treasury, signer));
-export const resolver = (signer?: Signer) => new ResolverClient(options(CONTRACTS.resolver, signer));
-export const reasoningRegistry = (signer?: Signer) =>
-  new ReasoningRegistryClient(options(CONTRACTS.reasoningRegistry, signer));
+export const marketCore = (signer?: Signer, opts?: { timeoutInSeconds?: number }) =>
+  new MarketCoreClient(options(CONTRACTS.marketCore, signer, opts));
+export const treasury = (signer?: Signer, opts?: { timeoutInSeconds?: number }) =>
+  new TreasuryClient(options(CONTRACTS.treasury, signer, opts));
+export const resolver = (signer?: Signer, opts?: { timeoutInSeconds?: number }) =>
+  new ResolverClient(options(CONTRACTS.resolver, signer, opts));
+export const reasoningRegistry = (signer?: Signer, opts?: { timeoutInSeconds?: number }) =>
+  new ReasoningRegistryClient(options(CONTRACTS.reasoningRegistry, signer, opts));
 
 /**
  * The USDC Stellar Asset Contract. A SAC has no Wasm and so no generated
