@@ -2,11 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { Keypair, scValToNative, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import type { AssembledTransaction } from "@stellar/stellar-sdk/contract";
 import { useWallet } from "@/lib/contexts/WalletContext";
 import { marketCore, reasoningRegistry, token, Outcomes, rpcServer, type OutcomeTag, type Signer } from "@/lib/stellar/clients";
-import { describeError, UserFacingError, type ContractName } from "@/lib/stellar/errors";
+import { describeError, describeSubmission, UserFacingError, type ContractName } from "@/lib/stellar/errors";
 import { BPS, priceYesBps } from "@/lib/stellar/generated/fpmm";
 import type { Config, Market as OnChainMarket, Position } from "@/lib/stellar/generated/market-core";
 import { fetchAndVerifyTrace, type TraceCheck } from "@/lib/stellar/trace";
@@ -35,6 +35,24 @@ import { minCollateralForShares } from "@/lib/stellar/quote";
 import { reconcileWithQuote, solveSellForShares } from "@/lib/stellar/sell-solver";
 import { confirmTrade, cancelTradeReads } from "@/lib/stellar/optimistic-cache";
 import { reconcileRead, type Stamped } from "@/lib/stellar/optimistic";
+import {
+  MULTISIG_DEFAULT_SLIPPAGE_BPS,
+  MULTISIG_DEFAULT_TIMEOUT_S,
+  MULTISIG_SESSIONS_KEY,
+  isExpiredByLedger,
+  isExpiredByWallClock,
+  isMultisigAccount,
+  loadMultisigSessions,
+  mergeSigned,
+  nonInvokerAddresses,
+  readAccountAuth,
+  removeMultisigSession,
+  requiredThreshold,
+  signatureWeight,
+  upsertMultisigSession,
+  type AccountAuth,
+  type MultisigSession,
+} from "@/lib/stellar/multisig";
 
 export { tradeInvalidationKeys };
 
@@ -647,19 +665,32 @@ export type PreparedWriteReview = (
   forceReview?: boolean,
 ) => Promise<boolean>;
 
-export async function prepareBuy(signer: Signer, params: Omit<BuyParams, "confirmBoundsChanged">): Promise<PreparedWrite> {
+export async function prepareBuy(
+  signer: Signer,
+  params: Omit<BuyParams, "confirmBoundsChanged">,
+  opts?: { timeoutInSeconds?: number; sourceAccount?: string },
+): Promise<PreparedWrite> {
   const id = toId(params.marketId);
+  const source = opts?.sourceAccount ?? signer.publicKey;
   const quote = simulated(
     await marketCore().quote_buy({ market_id: id, outcome: Outcomes[params.outcome], collateral_in: params.collateralIn }),
   );
   const minSharesOut = minOut(quote, params.slippageBps);
-  const tx = await marketCore(signer).buy({
-    trader: signer.publicKey,
-    market_id: id,
-    outcome: Outcomes[params.outcome],
-    collateral_in: params.collateralIn,
-    min_shares_out: minSharesOut,
-  });
+  const buildSigner: Signer =
+    opts?.sourceAccount && opts.sourceAccount !== signer.publicKey
+      ? { publicKey: source, signTransaction: signer.signTransaction }
+      : signer;
+  const timeout = opts?.timeoutInSeconds;
+  const tx = await marketCore(buildSigner, timeout !== undefined ? { timeoutInSeconds: timeout } : undefined).buy(
+    {
+      trader: source,
+      market_id: id,
+      outcome: Outcomes[params.outcome],
+      collateral_in: params.collateralIn,
+      min_shares_out: minSharesOut,
+    },
+    timeout !== undefined ? { timeoutInSeconds: timeout } : undefined,
+  );
   simulated(tx);
   return {
     tx,
@@ -667,7 +698,7 @@ export async function prepareBuy(signer: Signer, params: Omit<BuyParams, "confir
     contract: "marketCore",
     derived: { min_shares_out: { value: minSharesOut, from: `quote ${quote.toString()} shares, ${params.slippageBps / 100}% slippage` } },
     intent: {
-      trader: signer.publicKey,
+      trader: source,
       market_id: id.toString(),
       outcome: params.outcome,
       collateral_in: params.collateralIn.toString(),
@@ -681,15 +712,25 @@ export async function prepareBuy(signer: Signer, params: Omit<BuyParams, "confir
 export async function prepareSell(
   signer: Signer,
   params: { marketId: bigint | string; outcome: OutcomeTag; collateralOut: bigint; maxSharesIn: bigint },
+  opts?: { timeoutInSeconds?: number; sourceAccount?: string },
 ): Promise<PreparedWrite> {
   const id = toId(params.marketId);
-  const tx = await marketCore(signer).sell({
-    trader: signer.publicKey,
-    market_id: id,
-    outcome: Outcomes[params.outcome],
-    collateral_out: params.collateralOut,
-    max_shares_in: params.maxSharesIn,
-  });
+  const source = opts?.sourceAccount ?? signer.publicKey;
+  const buildSigner: Signer =
+    opts?.sourceAccount && opts.sourceAccount !== signer.publicKey
+      ? { publicKey: source, signTransaction: signer.signTransaction }
+      : signer;
+  const timeout = opts?.timeoutInSeconds;
+  const tx = await marketCore(buildSigner, timeout !== undefined ? { timeoutInSeconds: timeout } : undefined).sell(
+    {
+      trader: source,
+      market_id: id,
+      outcome: Outcomes[params.outcome],
+      collateral_out: params.collateralOut,
+      max_shares_in: params.maxSharesIn,
+    },
+    timeout !== undefined ? { timeoutInSeconds: timeout } : undefined,
+  );
   simulated(tx);
   return {
     tx,
@@ -697,7 +738,7 @@ export async function prepareSell(
     contract: "marketCore",
     derived: { max_shares_in: { value: params.maxSharesIn, from: "quote and slippage limit" } },
     intent: {
-      trader: signer.publicKey,
+      trader: source,
       market_id: id.toString(),
       outcome: params.outcome,
       collateral_out: params.collateralOut.toString(),
@@ -707,16 +748,29 @@ export async function prepareSell(
   };
 }
 
-export async function prepareRedeem(signer: Signer, marketId: bigint | string): Promise<PreparedWrite> {
+export async function prepareRedeem(
+  signer: Signer,
+  marketId: bigint | string,
+  opts?: { timeoutInSeconds?: number; sourceAccount?: string },
+): Promise<PreparedWrite> {
   const id = toId(marketId);
-  const tx = await marketCore(signer).redeem({ holder: signer.publicKey, market_id: id });
+  const source = opts?.sourceAccount ?? signer.publicKey;
+  const buildSigner: Signer =
+    opts?.sourceAccount && opts.sourceAccount !== signer.publicKey
+      ? { publicKey: source, signTransaction: signer.signTransaction }
+      : signer;
+  const timeout = opts?.timeoutInSeconds;
+  const tx = await marketCore(buildSigner, timeout !== undefined ? { timeoutInSeconds: timeout } : undefined).redeem(
+    { holder: source, market_id: id },
+    timeout !== undefined ? { timeoutInSeconds: timeout } : undefined,
+  );
   simulated(tx);
   return {
     tx,
     kind: "redeem",
     contract: "marketCore",
     derived: {},
-    intent: { holder: signer.publicKey, market_id: id.toString() },
+    intent: { holder: source, market_id: id.toString() },
     builtAt: Date.now(),
   };
 }
@@ -743,15 +797,26 @@ export async function redeemOnce(
 export async function prepareUsdcTransfer(
   signer: Signer,
   params: { to: string; amount: bigint },
+  opts?: { timeoutInSeconds?: number; sourceAccount?: string },
 ): Promise<PreparedWrite> {
-  const tx = await token.transfer({ from: signer.publicKey, to: params.to, amount: params.amount }, signer);
+  const source = opts?.sourceAccount ?? signer.publicKey;
+  const buildSigner: Signer =
+    opts?.sourceAccount && opts.sourceAccount !== signer.publicKey
+      ? { publicKey: source, signTransaction: signer.signTransaction }
+      : signer;
+  const tx = await token.transfer(
+    { from: source, to: params.to, amount: params.amount },
+    buildSigner,
+    undefined,
+    opts?.timeoutInSeconds !== undefined ? { timeoutInSeconds: opts.timeoutInSeconds } : {},
+  );
   simulated(tx, "marketCore");
   return {
     tx,
     kind: "usdc-transfer",
     contract: "usdc",
     derived: {},
-    intent: { from: signer.publicKey, to: params.to, amount: params.amount.toString() },
+    intent: { from: source, to: params.to, amount: params.amount.toString() },
     builtAt: Date.now(),
   };
 }
@@ -1394,3 +1459,454 @@ export function useUsdcTransfer() {
     phase: runner.phase,
   };
 }
+
+// ─── Multisig (export/import XDR) ───────────────────────────────────────────
+
+function multisigDummySigner(sourceAccount: string): Signer {
+  return {
+    publicKey: sourceAccount,
+    signTransaction: async () => {
+      throw new Error("Multisig prepare never signs. Export the XDR and collect signatures out of band.");
+    },
+  };
+}
+
+function newSessionId(): string {
+  try {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  } catch {
+    // fall through
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function txMeta(tx: AssembledTransaction<unknown>): {
+  xdr: string;
+  hash: string;
+  maxTime: number;
+  sourceAccount: string;
+  sequence: string;
+  fee: string;
+  quoteLedger?: number;
+} {
+  const built = tx.built;
+  if (!built) throw new Error("The transaction must be simulated before it can be exported.");
+  const bounds = built.timeBounds;
+  const maxTime = bounds?.maxTime ? Number(bounds.maxTime) : 0;
+  if (!maxTime) throw new Error("The prepared transaction has no expiry. Rebuild it with a validity window.");
+  return {
+    xdr: tx.toXDR(),
+    hash: Buffer.from(built.hash()).toString("hex").toLowerCase(),
+    maxTime,
+    sourceAccount: built.source,
+    sequence: built.sequence,
+    fee: built.fee,
+    quoteLedger: tx.simulation?.latestLedger,
+  };
+}
+
+async function cappedTimeout(
+  requested: number | undefined,
+  closeTime: bigint | undefined,
+  ledgerNow: number | null,
+): Promise<number> {
+  const want = requested ?? MULTISIG_DEFAULT_TIMEOUT_S;
+  if (closeTime === undefined || ledgerNow === null) return want;
+  const remaining = Number(closeTime) - Math.floor(ledgerNow) - 10;
+  if (remaining < 15) {
+    throw new UserFacingError({
+      kind: "contract",
+      code: "MarketClosed",
+      message: "This market closes too soon to prepare a multisig transaction.",
+    });
+  }
+  return Math.min(want, remaining);
+}
+
+export type MultisigPrepareInput =
+  | {
+      kind: "buy";
+      marketId: bigint | string;
+      outcome: OutcomeTag;
+      collateralIn: bigint;
+      slippageBps?: number;
+      sourceAccount?: string;
+      timeoutInSeconds?: number;
+    }
+  | {
+      kind: "sell";
+      marketId: bigint | string;
+      outcome: OutcomeTag;
+      shares: bigint;
+      mode?: "all" | "shares";
+      slippageBps?: number;
+      sourceAccount?: string;
+      timeoutInSeconds?: number;
+    }
+  | {
+      kind: "redeem";
+      marketId: bigint | string;
+      sourceAccount?: string;
+      timeoutInSeconds?: number;
+    }
+  | {
+      kind: "transfer";
+      to: string;
+      amount: bigint;
+      sourceAccount?: string;
+      timeoutInSeconds?: number;
+    };
+
+async function resolveSellBoundsForMultisig(
+  marketId: bigint,
+  outcome: OutcomeTag,
+  sharesInput: bigint,
+  mode: "all" | "shares" | undefined,
+  slippageBps: number,
+  holder: string,
+): Promise<{ collateralOut: bigint; maxSharesIn: bigint; shares: bigint }> {
+  const view = await fetchOnChainMarket(marketId);
+  const position = simulated(await marketCore().get_position({ market_id: marketId, holder }));
+  const heldShares = outcome === "Yes" ? position.yes : position.no;
+  const shares = mode === "all" ? heldShares : sharesInput;
+  if (shares <= 0n) {
+    throw new UserFacingError({ kind: "contract", code: "InvalidAmount", message: "Enter a share amount greater than zero." });
+  }
+  if (shares > heldShares) {
+    throw new UserFacingError({ kind: "contract", code: "InsufficientShares", message: "You don't have enough shares for this sale." });
+  }
+  const [rSold, rOther] = outcome === "Yes" ? [view.market.reserve_yes, view.market.reserve_no] : [view.market.reserve_no, view.market.reserve_yes];
+  const feeBps = BigInt(view.market.fee_bps);
+  const local = solveSellForShares(rSold, rOther, shares, feeBps);
+  if ("error" in local) {
+    throw new UserFacingError({
+      kind: "contract",
+      code: local.error === "too-small" ? "InvalidAmount" : "InsufficientLiquidity",
+      message:
+        local.error === "too-small"
+          ? "That's too few shares to sell after fees."
+          : "There isn't enough liquidity to sell that many shares.",
+    });
+  }
+  const quoteAt = async (collateralOut: bigint) =>
+    simulated(await marketCore().quote_sell({ market_id: marketId, outcome: Outcomes[outcome], collateral_out: collateralOut }));
+  const confirmed = await reconcileWithQuote(local, quoteAt);
+  if (confirmed.sharesIn > shares) {
+    throw new UserFacingError({ kind: "contract", code: "InsufficientShares", message: "You don't have enough shares for this sale." });
+  }
+  const maxSharesIn = [maxIn(confirmed.sharesIn, slippageBps), heldShares].reduce((a, b) => (a < b ? a : b));
+  return { collateralOut: confirmed.collateralOut, maxSharesIn, shares };
+}
+
+/** Reads on-ledger multisig config for an address (signers, thresholds, sequence). */
+export function useAccountAuth(address: string | null | undefined) {
+  return useQuery({
+    queryKey: ["stellar", "accountAuth", address ?? ""],
+    enabled: Boolean(address),
+    staleTime: 15_000,
+    queryFn: async (): Promise<AccountAuth> => readAccountAuth(address as string, rpcServer()),
+  });
+}
+
+/** Reactive view of persisted multisig sessions (sessionStorage, public data only). */
+export function useMultisigSessions() {
+  const [sessions, setSessions] = useState<MultisigSession[]>(() => loadMultisigSessions());
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === MULTISIG_SESSIONS_KEY) setSessions(loadMultisigSessions());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+  const refresh = useCallback(() => setSessions(loadMultisigSessions()), []);
+  const remove = useCallback(
+    (id: string) => setSessions(removeMultisigSession(id)),
+    [],
+  );
+  return { sessions, refresh, remove };
+}
+
+/**
+ * Builds a long-lived, never-submitted transaction and exports its XDR.
+ * Uses a 1h default window and 3% default slippage: the quote is from ledger N
+ * and the trade fails with SlippageExceeded (error 12) if the price moves further.
+ */
+export function usePrepareMultisig() {
+  const guard = useWriteGuard();
+  return useMutation({
+    mutationFn: async (input: MultisigPrepareInput): Promise<MultisigSession> => {
+      const coordinator = guard();
+      const sourceAccount =
+        ("sourceAccount" in input && input.sourceAccount) || coordinator.publicKey;
+      const requestedTimeout =
+        ("timeoutInSeconds" in input && input.timeoutInSeconds) || MULTISIG_DEFAULT_TIMEOUT_S;
+      const dummy = multisigDummySigner(sourceAccount);
+      // A never-called signer proves the prepare path cannot submit: any
+      // accidental signAndSend throws instead of touching the network.
+      void dummy;
+
+      let tx: AssembledTransaction<unknown>;
+      let kind: MultisigSession["kind"];
+      let contractId: string;
+      let fn: string;
+      let args: Record<string, string> = {};
+      let closeTime: number | undefined;
+      let quoteLedger: number | undefined;
+
+      if (input.kind === "buy") {
+        const slippage = input.slippageBps ?? MULTISIG_DEFAULT_SLIPPAGE_BPS;
+        const id = toId(input.marketId);
+        const [view, ledgerNow] = await Promise.all([fetchOnChainMarket(id), fetchLedgerNow().catch(() => null)]);
+        closeTime = Number(view.market.close_time);
+        const timeout = await cappedTimeout(requestedTimeout, view.market.close_time, ledgerNow === null ? null : Number(ledgerNow));
+        const quote = simulated(await marketCore().quote_buy({ market_id: id, outcome: Outcomes[input.outcome], collateral_in: input.collateralIn }));
+        const minSharesOut = minOut(quote, slippage);
+        tx = (await marketCore({ publicKey: sourceAccount, signTransaction: async () => { throw new Error("Multisig prepare never signs."); } }, { timeoutInSeconds: timeout }).buy(
+          { trader: sourceAccount, market_id: id, outcome: Outcomes[input.outcome], collateral_in: input.collateralIn, min_shares_out: minSharesOut },
+          { timeoutInSeconds: timeout },
+        )) as unknown as AssembledTransaction<unknown>;
+        simulated(tx);
+        kind = "buy";
+        contractId = CONTRACTS.marketCore;
+        fn = "buy";
+        args = {
+          trader: sourceAccount,
+          market_id: id.toString(),
+          outcome: input.outcome,
+          collateral_in: input.collateralIn.toString(),
+          min_shares_out: minSharesOut.toString(),
+        };
+        quoteLedger = tx.simulation?.latestLedger;
+      } else if (input.kind === "sell") {
+        const slippage = input.slippageBps ?? MULTISIG_DEFAULT_SLIPPAGE_BPS;
+        const id = toId(input.marketId);
+        const [view, ledgerNow] = await Promise.all([fetchOnChainMarket(id), fetchLedgerNow().catch(() => null)]);
+        closeTime = Number(view.market.close_time);
+        const timeout = await cappedTimeout(requestedTimeout, view.market.close_time, ledgerNow === null ? null : Number(ledgerNow));
+        const { collateralOut, maxSharesIn } = await resolveSellBoundsForMultisig(
+          id,
+          input.outcome,
+          input.shares,
+          input.mode,
+          slippage,
+          sourceAccount,
+        );
+        tx = (await marketCore({ publicKey: sourceAccount, signTransaction: async () => { throw new Error("Multisig prepare never signs."); } }, { timeoutInSeconds: timeout }).sell(
+          { trader: sourceAccount, market_id: id, outcome: Outcomes[input.outcome], collateral_out: collateralOut, max_shares_in: maxSharesIn },
+          { timeoutInSeconds: timeout },
+        )) as unknown as AssembledTransaction<unknown>;
+        simulated(tx);
+        kind = "sell";
+        contractId = CONTRACTS.marketCore;
+        fn = "sell";
+        args = {
+          trader: sourceAccount,
+          market_id: id.toString(),
+          outcome: input.outcome,
+          collateral_out: collateralOut.toString(),
+          max_shares_in: maxSharesIn.toString(),
+        };
+        quoteLedger = tx.simulation?.latestLedger;
+      } else if (input.kind === "redeem") {
+        const id = toId(input.marketId);
+        const timeout = await cappedTimeout(requestedTimeout, undefined, null);
+        tx = (await marketCore({ publicKey: sourceAccount, signTransaction: async () => { throw new Error("Multisig prepare never signs."); } }, { timeoutInSeconds: timeout }).redeem(
+          { holder: sourceAccount, market_id: id },
+          { timeoutInSeconds: timeout },
+        )) as unknown as AssembledTransaction<unknown>;
+        simulated(tx);
+        kind = "redeem";
+        contractId = CONTRACTS.marketCore;
+        fn = "redeem";
+        args = { holder: sourceAccount, market_id: id.toString() };
+        quoteLedger = tx.simulation?.latestLedger;
+      } else {
+        if (input.amount <= 0n) throw new UserFacingError({ kind: "contract", message: "Enter an amount greater than zero." });
+        const timeout = await cappedTimeout(requestedTimeout, undefined, null);
+        tx = (await token.transfer(
+          { from: sourceAccount, to: input.to, amount: input.amount },
+          { publicKey: sourceAccount, signTransaction: async () => { throw new Error("Multisig prepare never signs."); } },
+          undefined,
+          { timeoutInSeconds: timeout },
+        )) as unknown as AssembledTransaction<unknown>;
+        simulated(tx, "marketCore");
+        kind = "transfer";
+        contractId = CONTRACTS.usdc;
+        fn = "transfer";
+        args = { from: sourceAccount, to: input.to, amount: input.amount.toString() };
+        quoteLedger = tx.simulation?.latestLedger;
+      }
+
+      const meta = txMeta(tx);
+      const server = rpcServer();
+      const auth = await readAccountAuth(meta.sourceAccount, server);
+      const threshold = requiredThreshold(tx.built as unknown as import("@stellar/stellar-sdk").Transaction, auth);
+      const nonInvoker = nonInvokerAddresses(tx);
+      const session: MultisigSession = {
+        id: newSessionId(),
+        kind,
+        xdr: meta.xdr,
+        hash: meta.hash,
+        builtAt: Date.now(),
+        maxTime: meta.maxTime,
+        sourceAccount: meta.sourceAccount,
+        sequence: meta.sequence,
+        fee: meta.fee,
+        contractId,
+        fn,
+        requiredThreshold: threshold,
+        auth,
+        quoteLedger: quoteLedger ?? meta.quoteLedger,
+        ledgerSequence: tx.simulation?.latestLedger,
+        nonInvoker,
+        ...(closeTime !== undefined ? { closeTime } : {}),
+        args,
+      };
+      upsertMultisigSession(session);
+      return session;
+    },
+  });
+}
+
+export interface MultisigImportResult {
+  session: MultisigSession;
+  weight: number;
+  signedBy: string[];
+  unknown: number;
+}
+
+/** Merges an imported signed XDR into a session (any number of times) and persists it. */
+export function useImportMultisig() {
+  return useMutation({
+    mutationFn: async ({ session, importedXdr }: { session: MultisigSession; importedXdr: string }): Promise<MultisigImportResult> => {
+      const built = TransactionBuilder.fromXDR(session.xdr, NETWORK_PASSPHRASE) as import("@stellar/stellar-sdk").Transaction;
+      const merged = mergeSigned(built, importedXdr.trim(), NETWORK_PASSPHRASE);
+      const xdrOut = merged.toEnvelope().toXDR("base64");
+      const hash = Buffer.from(merged.hash()).toString("hex").toLowerCase();
+      if (hash !== session.hash) {
+        throw new UserFacingError({ kind: "contract", message: "The imported transaction does not match the prepared one." });
+      }
+      const { weight, signedBy, unknown } = signatureWeight(merged, session.auth, NETWORK_PASSPHRASE);
+      const next: MultisigSession = { ...session, xdr: xdrOut };
+      upsertMultisigSession(next);
+      return { session: next, weight, signedBy, unknown };
+    },
+  });
+}
+
+/**
+ * Submits a multisig session once the on-ledger weight meets the threshold.
+ * Re-reads the account sequence to catch `tx_bad_seq` early, rejects expired
+ * or under-threshold sessions, submits via RPC and polls `getTransaction`.
+ */
+export function useSubmitMultisig() {
+  const queryClient = useQueryClient();
+  const tracker = useTxTracker();
+  return useMutation({
+    mutationFn: async ({ session }: { session: MultisigSession }): Promise<{ txHash: string; ledger: number }> => {
+      const tx = TransactionBuilder.fromXDR(session.xdr, NETWORK_PASSPHRASE) as import("@stellar/stellar-sdk").Transaction;
+      const hash = Buffer.from(tx.hash()).toString("hex").toLowerCase();
+      if (hash !== session.hash) {
+        throw new UserFacingError({ kind: "contract", message: "The session XDR no longer matches the prepared transaction. Prepare it again." });
+      }
+      const server = rpcServer();
+      const freshAuth = await readAccountAuth(session.sourceAccount, server).catch((err: unknown) => {
+        throw new UserFacingError(describeError(err), err);
+      });
+      const expectedSeq = (BigInt(session.sequence) - 1n).toString();
+      if (freshAuth.sequence.toString() !== expectedSeq) {
+        // Any other transaction from the source bumps the sequence and
+        // invalidates the prepared one.
+        throw new UserFacingError({
+          kind: "stale-sequence",
+          code: "txBadSeq",
+          message: "Another transaction from this account changed the sequence. Prepare it again with a fresh quote.",
+        });
+      }
+      const { weight, signedBy } = signatureWeight(tx, freshAuth, NETWORK_PASSPHRASE);
+      const threshold = requiredThreshold(tx, freshAuth);
+      if (weight < threshold) {
+        throw new UserFacingError({
+          kind: "bad-auth",
+          code: "tx_bad_auth",
+          message: `This account needs more signatures to meet its threshold (${weight}/${threshold}). Collect the remaining signatures before submitting.`,
+        });
+      }
+      void signedBy;
+      let latestClose = 0;
+      try {
+        const latest = await server.getLatestLedger();
+        latestClose = Number((latest as unknown as { closeTime?: string | number }).closeTime ?? 0);
+      } catch {
+        latestClose = 0;
+      }
+      if (isExpiredByWallClock(session.maxTime) || (latestClose > 0 && isExpiredByLedger(session.maxTime, latestClose))) {
+        throw new UserFacingError({
+          kind: "expired",
+          code: "tx_too_late",
+          message: "This transaction expired before it was submitted. Prepare it again with a fresh quote.",
+        });
+      }
+      if (session.closeTime !== undefined && latestClose > 0 && latestClose >= session.closeTime) {
+        throw new UserFacingError({ kind: "contract", code: "MarketClosed", message: "This market has closed. Trading has stopped." });
+      }
+      let sendRes: import("@stellar/stellar-sdk").rpc.Api.SendTransactionResponse;
+      try {
+        sendRes = await server.sendTransaction(tx);
+      } catch (err) {
+        throw new UserFacingError(describeError(err), err);
+      }
+      if (sendRes.status === "ERROR") {
+        throw new UserFacingError(describeSubmission(sendRes), sendRes);
+      }
+      if (sendRes.status === "TRY_AGAIN_LATER") {
+        throw new UserFacingError(describeSubmission(sendRes), sendRes);
+      }
+      const txHash = sendRes.hash;
+      tracker.track({
+        hash: txHash,
+        kind: session.kind === "transfer" ? "usdc-transfer" : session.kind,
+        holder: session.sourceAccount,
+        marketId: session.args?.market_id,
+        amounts: session.args ?? {},
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
+      const deadline = Date.now() + 60_000;
+      let delay = 1000;
+      for (;;) {
+        if (Date.now() > deadline) {
+          throw new UserFacingError({ kind: "expired", message: "Transaction expired without confirmation." });
+        }
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 1.5, 5000);
+        let got: import("@stellar/stellar-sdk").rpc.Api.GetTransactionResponse;
+        try {
+          got = await server.getTransaction(txHash);
+        } catch {
+          continue;
+        }
+        if (got.status === "SUCCESS") {
+          for (const key of tradeInvalidationKeys(session.args?.market_id ?? "", session.sourceAccount)) {
+            void queryClient.invalidateQueries({ queryKey: key });
+          }
+          return { txHash, ledger: got.ledger };
+        }
+        if (got.status === "FAILED") {
+          const described = describeError(`${got.resultXdr ?? ""} Transaction failed on chain`);
+          const failed: import("@/lib/stellar/errors").TxDescribedError = { ...described, submission: "failed-on-chain" };
+          throw new UserFacingError(failed, got);
+        }
+        // NOT_FOUND: keep polling until the wall-clock deadline.
+      }
+    },
+  });
+}
+
+/** True when the connected wallet is not among the account's ed25519 signers. */
+export function isCoordinatorWarning(session: MultisigSession, connectedAddress: string | null): boolean {
+  if (!connectedAddress) return false;
+  return !session.auth.signers.some((s) => s.type === "ed25519" && s.key === connectedAddress);
+}
+
+export { isMultisigAccount };
+export type { AccountAuth, MultisigSession };
