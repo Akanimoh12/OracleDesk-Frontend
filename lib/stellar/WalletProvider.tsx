@@ -47,7 +47,8 @@ export interface WalletContextValue {
   disconnect: () => Promise<void>;
 }
 
-const WalletContext = createContext<WalletContextValue | null>(null);
+/** Exported so tests and stories can supply a fake value without the wallet kit. */
+export const WalletContext = createContext<WalletContextValue | null>(null);
 
 export function useWallet(): WalletContextValue {
   const ctx = useContext(WalletContext);
