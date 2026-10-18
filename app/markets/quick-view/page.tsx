@@ -267,10 +267,10 @@ function MarketQuickViewContent() {
     return (
       <main className="relative min-h-[calc(100vh-64px)] overflow-hidden bg-surface flex flex-col items-center justify-center p-6 text-center">
         <span className="material-symbols-outlined text-error text-6xl mb-4">error</span>
-        <h2 className="text-headline-md mb-2">Market Not Found</h2>
+        <h2 className="text-headline-md mb-2">Market not found</h2>
         <p className="text-on-surface-variant mb-6">The market you are looking for does not exist or could not be loaded.</p>
-        <Link href="/markets" className="bg-primary text-white px-6 py-2 rounded-lg font-label-caps">
-          BACK TO MARKETS
+        <Link href="/markets" className="bg-primary text-white px-6 py-2 rounded-lg font-label-caps uppercase">
+          Back to markets
         </Link>
       </main>
     );
@@ -334,7 +334,7 @@ function MarketQuickViewContent() {
                 <Link 
                   href="/markets"
                   aria-label="Close"
-                  className="text-outline hover:text-on-surface transition-colors p-1"
+                  className="text-outline hover:text-on-surface transition-colors min-h-11 min-w-11 flex items-center justify-center"
                 >
                   <span className="material-symbols-outlined">close</span>
                 </Link>

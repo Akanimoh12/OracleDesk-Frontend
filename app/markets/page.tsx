@@ -11,6 +11,7 @@ import { useOnChainMarket, useOnChainMarkets, type OnChainMarketView } from "@/l
 import type { Market, MarketStatus, MarketTracePreview } from "@/lib/api/markets";
 import { BACKEND_CATEGORIES, BACKEND_CATEGORY_LABELS } from "@/lib/stellar/categories";
 import { formatUsdc } from "@/lib/stellar/units";
+import { NETWORK_LABEL } from "@/lib/stellar/config";
 
 /** Where a displayed value came from, wherever backend and chain can disagree. */
 const SourceTag = ({ source }: { source: "chain" | "backend" }) => (
@@ -80,7 +81,7 @@ const FilterBar = ({
           </div>
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-secondary animate-pulse motion-reduce:animate-none"></span>
-            <span className="font-data-mono text-label-caps text-secondary uppercase">Stellar Testnet</span>
+            <span className="font-data-mono text-label-caps text-secondary uppercase">{NETWORK_LABEL}</span>
           </div>
         </div>
       </div>
